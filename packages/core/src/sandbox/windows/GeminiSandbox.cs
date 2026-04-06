@@ -142,6 +142,12 @@ public class GeminiSandbox {
     static extern bool ConvertStringSidToSid(string StringSid, out IntPtr ptrSid);
 
     [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool InitializeAcl(IntPtr pAcl, uint nAclLength, uint dwAclRevision);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AddMandatoryAce(IntPtr pAcl, uint dwAceRevision, uint AceFlags, uint MandatoryPolicy, IntPtr pLabelSid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool SetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, uint TokenInformationLength);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -220,6 +226,10 @@ public class GeminiSandbox {
     private const uint DISABLE_MAX_PRIVILEGE = 0x1;
     private const int SE_FILE_OBJECT = 1;
     private const uint LABEL_SECURITY_INFORMATION = 0x00000010;
+    private const uint SECURITY_MANDATORY_LOW_RID = 0x00001000;
+    private const uint SYSTEM_MANDATORY_LABEL_NO_WRITE_UP = 0x1;
+    private const uint CONTAINER_INHERIT_ACE = 0x2;
+    private const uint OBJECT_INHERIT_ACE = 0x1;
 
     private static HashSet<string> forbiddenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -456,6 +466,36 @@ public class GeminiSandbox {
         }
     }
 
+    private static void SetLowIntegritySacl(string path) {
+        IntPtr pSid = IntPtr.Zero;
+        IntPtr pSacl = IntPtr.Zero;
+        try {
+            if (ConvertStringSidToSid("S-1-16-4096", out pSid)) {
+                // ACL Header (8 bytes) + ACE Header (8 bytes) + SID (up to 68 bytes) + Padding
+                uint cbAcl = 100; 
+                pSacl = Marshal.AllocHGlobal((int)cbAcl);
+                
+                if (InitializeAcl(pSacl, cbAcl, 2)) { // ACL_REVISION = 2
+                    if (AddMandatoryAce(pSacl, 2, CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, pSid)) {
+                        uint res = SetNamedSecurityInfo(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, pSacl);
+                        if (res != 0) Console.Error.WriteLine("SetNamedSecurityInfo failed for " + path + " with error code: " + res);
+                    } else {
+                        Console.Error.WriteLine("AddMandatoryAce failed: " + Marshal.GetLastWin32Error());
+                    }
+                } else {
+                    Console.Error.WriteLine("InitializeAcl failed: " + Marshal.GetLastWin32Error());
+                }
+            } else {
+                Console.Error.WriteLine("ConvertStringSidToSid failed: " + Marshal.GetLastWin32Error());
+            }
+        } catch(Exception e) {
+            Console.Error.WriteLine("Error in SetLowIntegritySacl for " + path + ": " + e.Message);
+        } finally {
+            if (pSid != IntPtr.Zero) LocalFree(pSid);
+            if (pSacl != IntPtr.Zero) Marshal.FreeHGlobal(pSacl);
+        }
+    }
+
     private static void ApplyManifest(string manifestPath) {
         EnablePrivilege(SE_SECURITY_NAME);
         if (!File.Exists(manifestPath)) return;
@@ -464,22 +504,7 @@ public class GeminiSandbox {
             char op = line[0];
             string path = line.Substring(2).Trim();
             if (op == 'L') {
-                try {
-                    IntPtr pSD = IntPtr.Zero;
-                    uint sdSize;
-                    if (ConvertStringSecurityDescriptorToSecurityDescriptor("S:(ML;;NW;;;LW)", 1, out pSD, out sdSize)) {
-                        bool saclPresent;
-                        IntPtr pSacl;
-                        bool saclDefaulted;
-                        if (GetSecurityDescriptorSacl(pSD, out saclPresent, out pSacl, out saclDefaulted) && saclPresent) {
-                            SetNamedSecurityInfo(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, pSacl);
-                        }
-                    }
-                } catch {
-                    // Ignore errors for individual paths
-                } finally {
-                    // We can't free pSD here easily if we declare it inside the try block without changing scope, but LocalFree is robust.
-                }
+                SetLowIntegritySacl(path);
 
                 try {
                     if (Directory.Exists(path)) {
@@ -493,8 +518,8 @@ public class GeminiSandbox {
                         fs.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier("S-1-16-4096"), FileSystemRights.Modify, AccessControlType.Allow));
                         fInfo.SetAccessControl(fs);
                     }
-                } catch {
-                    // Ignore access errors
+                } catch(Exception e) {
+                    Console.Error.WriteLine("Error in GrantLowIntegrityDacl for " + path + ": " + e.Message);
                 }
             } else if (op == 'D') {
                 DenyLowIntegrityDacl(path);
