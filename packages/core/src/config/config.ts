@@ -2243,23 +2243,8 @@ export class Config implements McpContext, AgentLoopContext {
       this.plansDirCache.set(context, plansDir);
     }
 
-    if (!this.planEnabled || this.initializedPlanDirs.has(plansDir)) {
+    if (this.initializedPlanDirs.has(plansDir)) {
       return plansDir;
-    }
-
-    let mkdirError: unknown;
-    try {
-      fs.mkdirSync(plansDir, { recursive: true });
-    } catch (e: unknown) {
-      mkdirError = e;
-    }
-    let realPlansDir: string;
-    try {
-      realPlansDir = resolveToRealPath(plansDir);
-    } catch {
-      // Fallback to path.resolve if the directory doesn't exist yet (e.g. mkdirSync failed)
-      // so that the security check can still be performed on the absolute path.
-      realPlansDir = path.resolve(plansDir);
     }
 
     const realProjectRoot = this.storage.getRealProjectRoot();
@@ -2269,26 +2254,58 @@ export class Config implements McpContext, AgentLoopContext {
     } catch {
       realGlobalGeminiDir = path.resolve(Storage.getGlobalGeminiDir());
     }
+
+    // 1. Lexical security check (before any filesystem mutation or return)
+    const lexicalPlansDir = path.resolve(plansDir);
     if (
-      !isSubpath(realProjectRoot, realPlansDir) &&
-      !isSubpath(realGlobalGeminiDir, realPlansDir)
+      !isSubpath(realProjectRoot, lexicalPlansDir) &&
+      !isSubpath(realGlobalGeminiDir, lexicalPlansDir)
     ) {
       throw new SecurityError(
-        `Security violation: Resolved plan directory '${realPlansDir}' is outside both the project root '${realProjectRoot}' and the global configuration directory.`,
+        `Security violation: Plan directory '${lexicalPlansDir}' is outside both the project root '${realProjectRoot}' and the global configuration directory.`,
       );
+    }
+
+    // 2. We only attempt to physically create the directory if plan mode is enabled
+    if (this.planEnabled) {
+      let mkdirError: unknown;
+      try {
+        fs.mkdirSync(plansDir, { recursive: true });
+      } catch (e: unknown) {
+        mkdirError = e;
+      }
+
+      // 3. Physical security check (after creation, to mitigate TOCTOU symlink attacks)
+      let realPlansDir: string;
+      try {
+        realPlansDir = resolveToRealPath(plansDir);
+      } catch {
+        // Fallback to path.resolve if the directory doesn't exist yet (e.g. mkdirSync failed)
+        // so that the security check can still be performed on the absolute path.
+        realPlansDir = path.resolve(plansDir);
+      }
+
+      if (
+        !isSubpath(realProjectRoot, realPlansDir) &&
+        !isSubpath(realGlobalGeminiDir, realPlansDir)
+      ) {
+        throw new SecurityError(
+          `Security violation: Resolved plan directory '${realPlansDir}' is outside both the project root '${realProjectRoot}' and the global configuration directory.`,
+        );
+      }
+
+      if (mkdirError) {
+        const errorMessage =
+          mkdirError instanceof Error ? mkdirError.message : String(mkdirError);
+        process.stderr.write(
+          `Failed to initialize active plan directory at '${plansDir}': ${errorMessage}\n`,
+        );
+      } else {
+        this.workspaceContext.addDirectory(realPlansDir);
+      }
     }
 
     this.initializedPlanDirs.add(plansDir);
-
-    if (mkdirError) {
-      const errorMessage =
-        mkdirError instanceof Error ? mkdirError.message : String(mkdirError);
-      process.stderr.write(
-        `Failed to initialize active plan directory at '${plansDir}': ${errorMessage}\n`,
-      );
-    } else {
-      this.workspaceContext.addDirectory(realPlansDir);
-    }
     return plansDir;
   }
 
